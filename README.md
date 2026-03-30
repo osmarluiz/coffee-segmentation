@@ -95,7 +95,7 @@ Masks are shared across all datasets and stored in `Planet_GT6/class_*/`.
 
 ### Obtaining the Data
 
-- **Sentinel-1 (VH, VV) and ground truth masks** are available on Hugging Face: *link to be added*
+- **Sentinel-1 (VH, VV) and ground truth masks** are available on Hugging Face: [osmarluiz/coffee-segmentation-dataset](https://huggingface.co/datasets/osmarluiz/coffee-segmentation-dataset)
 - **Planet NICFI imagery** is subject to the [NICFI license](https://www.planet.com/nicfi/). Users must obtain Planet data independently through the NICFI program archive. See `prepare_combined.py` for instructions on generating the Combined dataset.
 
 ### Preparing the Combined Dataset
