@@ -101,10 +101,14 @@ def log(msg, log_file):
 def load_status(model_dir):
     f = os.path.join(model_dir, 'training_status.json')
     if os.path.exists(f):
-        s = json.load(open(f))
-        s.setdefault('best_miou', -float('inf'))
-        s.setdefault('best_miou_epoch', -1)
-        return s
+        try:
+            s = json.load(open(f))
+            s.setdefault('best_miou', -float('inf'))
+            s.setdefault('best_miou_epoch', -1)
+            return s
+        except (json.JSONDecodeError, ValueError):
+            # Truncated/corrupted status (e.g. crash mid-write). Start clean.
+            print(f'WARNING: {f} is corrupted; ignoring it.', flush=True)
     return {
         'last_completed_epoch': -1,
         'best_loss': float('inf'),
@@ -116,12 +120,14 @@ def load_status(model_dir):
 
 def save_status(model_dir, epoch, best_loss, best_epoch, best_miou, best_miou_epoch):
     f = os.path.join(model_dir, 'training_status.json')
+    # Cast to native Python types — numpy.float32 (from AverageValueMeter.mean)
+    # is not JSON-serializable.
     json.dump({
-        'last_completed_epoch': epoch,
-        'best_loss': best_loss,
-        'best_model_epoch': best_epoch,
-        'best_miou': best_miou,
-        'best_miou_epoch': best_miou_epoch,
+        'last_completed_epoch': int(epoch),
+        'best_loss': float(best_loss),
+        'best_model_epoch': int(best_epoch),
+        'best_miou': float(best_miou),
+        'best_miou_epoch': int(best_miou_epoch),
     }, open(f, 'w'))
 
 
@@ -351,10 +357,12 @@ def train_one_window(window, args, device, log_file, results_csv):
             'months': months,
             'in_channels': in_channels,
             'best_loss_epoch': best_loss_epoch + 1,
-            'best_val_loss': best_loss,
+            # Cast: best_loss / best_miou come from AverageValueMeter.mean as
+            # numpy.float32, which is not JSON-serializable.
+            'best_val_loss': float(best_loss),
             'test_by_loss': results_loss,
             'best_miou_epoch': best_miou_epoch + 1 if best_miou_epoch >= 0 else None,
-            'best_val_miou': best_miou if best_miou > -float('inf') else None,
+            'best_val_miou': float(best_miou) if best_miou > -float('inf') else None,
             'test_by_miou': results_miou,
         }, f, indent=2)
 
