@@ -16,7 +16,11 @@ Deep learning-based semantic segmentation of coffee plantations and eucalyptus i
 
 This repository provides the full training and evaluation pipeline for coffee plantation mapping using multi-modal satellite imagery. We evaluate **18 model configurations** (6 architectures × 3 encoders) across **4 input modalities**, using a dataset of **2,800 densely annotated tiles** (512 × 512 pixels) from Patrocinio, Minas Gerais — Brazil's largest coffee-producing region.
 
-> **Update (post-paper):** Mask2Former (Cheng et al., 2022) is now available as a 7th architecture. See [Mask2Former](#mask2former-extension) below. Results in the table above reflect the original 6-architecture benchmark.
+> **Updates (post-paper):**
+> - Mask2Former (Cheng et al., 2022) is now available as a 7th architecture. See [Mask2Former](#mask2former-extension) below.
+> - Temporal ablation study (3 / 6 / 9 / 12 months) using SegFormer + EfficientNet-B7 on Planet. See [`TEMPORAL_ABLATION.md`](TEMPORAL_ABLATION.md).
+>
+> Results in the table above reflect the original 6-architecture benchmark.
 
 ### Input Modalities
 

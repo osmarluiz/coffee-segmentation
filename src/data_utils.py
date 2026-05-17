@@ -20,15 +20,27 @@ class CustomDataset(Dataset):
 
     Handles:
     - Multi-channel TIFF loading via rasterio (supports up to 108 channels)
+    - Optional band selection (read only specific bands, e.g. for temporal ablation)
     - Label remapping: original labels 2->1, 3->2
     - Synchronized augmentation for image-mask pairs
     """
 
-    def __init__(self, image_paths, target_paths, transform=None, transform_label=None):
+    def __init__(self, image_paths, target_paths, transform=None, transform_label=None,
+                 band_indices=None):
+        """
+        Args:
+            band_indices: optional list of 0-indexed bands to read (e.g. [0,1,2,3]
+                for the first 4 bands). When None, all bands are read.
+                Used for temporal ablation (subsetting Planet to N months).
+        """
         self.image_paths = image_paths
         self.target_paths = target_paths
         self.transform = transform
         self.transform_label = transform_label
+        # rasterio uses 1-indexed bands
+        self.rasterio_indexes = (
+            [i + 1 for i in band_indices] if band_indices is not None else None
+        )
 
         if len(image_paths) != len(target_paths):
             raise ValueError(
@@ -37,7 +49,11 @@ class CustomDataset(Dataset):
     def __getitem__(self, index):
         # Load multi-channel image with rasterio
         with rasterio.open(self.image_paths[index]) as src:
-            image = src.read().astype(np.float32)
+            if self.rasterio_indexes is not None:
+                # Read only the selected bands (much faster for band subsets)
+                image = src.read(indexes=self.rasterio_indexes).astype(np.float32)
+            else:
+                image = src.read().astype(np.float32)
             image = np.moveaxis(image, 0, -1)  # (C,H,W) -> (H,W,C)
 
         # Load mask
