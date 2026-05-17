@@ -28,3 +28,6 @@ Thumbs.db
 figures/
 tables/
 *.csv
+
+# Training logs
+*.log

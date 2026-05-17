@@ -16,6 +16,8 @@ Deep learning-based semantic segmentation of coffee plantations and eucalyptus i
 
 This repository provides the full training and evaluation pipeline for coffee plantation mapping using multi-modal satellite imagery. We evaluate **18 model configurations** (6 architectures × 3 encoders) across **4 input modalities**, using a dataset of **2,800 densely annotated tiles** (512 × 512 pixels) from Patrocinio, Minas Gerais — Brazil's largest coffee-producing region.
 
+> **Update (post-paper):** Mask2Former (Cheng et al., 2022) is now available as a 7th architecture. See [Mask2Former](#mask2former-extension) below. Results in the table above reflect the original 6-architecture benchmark.
+
 ### Input Modalities
 
 | Dataset | Bands | Description |
@@ -149,6 +151,7 @@ python train.py --dataset VH --model Segformer --encoder efficientnet-b7 --resum
 | `--lr` | `0.001` | Learning rate |
 | `--data-dir` | `DATASET` | Path to dataset root |
 | `--output-dir` | `models` | Path to save models |
+| `--amp` | `auto` | Autocast dtype: `auto` (bf16 only for Mask2Former), `bfloat16`, `float16`, `none`. bf16 dispenses GradScaler. |
 
 ### Evaluation
 
@@ -203,6 +206,98 @@ cafe-segmentation/
 | PSPNet | Zhao et al. (2017) |
 | DeepLabV3+ | Chen et al. (2018) |
 | SegFormer | Xie et al. (2021) |
+| Mask2Former (post-paper extension) | Cheng et al. (2022) |
+
+---
+
+## Mask2Former extension
+
+Mask2Former (Cheng et al., 2022) is integrated into the bundled SMP fork at
+[`segmentation_models_pytorch/decoders/mask2former/`](segmentation_models_pytorch/decoders/mask2former/)
+and exposed as `smp.Mask2Former(...)`. Unlike the six per-pixel-classification
+baselines, Mask2Former is a **mask-classification** model and is trained with a
+full **Hungarian set-prediction** pipeline.
+
+### Architecture
+
+- **Backbone**: any SMP encoder (we use `efficientnet-b7`, matching the
+  baselines). Accepts arbitrary `in_channels` (30 / 48 / 108).
+- **Pixel decoder**: standard `nn.TransformerEncoderLayer` self-attention on
+  strides 16 and 32 (jointly self-attended) plus FPN top-down 3×3 convs that
+  produce strides 8 and 4. Stride-4 features are the *mask features*.
+- **Transformer decoder**: 100 learnable object queries + learnable positional
+  queries; 9 layers (3 rounds × 3 scales) with **masked** cross-attention (the
+  previous layer's mask prediction gates which pixels each query attends to),
+  self-attention among queries, then FFN.
+- **Heads**: per-query class head (`C + 1` logits, the extra one is
+  "no-object") and a 3-layer MLP mask-embedding head; mask logits via einsum
+  between the mask embedding and the stride-4 mask features.
+- **Semantic output**: `softmax(class)[:,:,:-1] ⊗ sigmoid(mask)` summed over
+  queries (paper Eq. 5), upsampled 4× to full resolution.
+
+### Training pipeline
+
+- **HungarianMatcher** (`matcher.py`): bipartite matching between queries and
+  GT instances (one instance per class present in the tile); cost = weighted
+  sum of negative class probability + mask BCE + mask dice.
+- **SetCriterion** (`criterion.py`): classification CE (matched queries get
+  their GT class, unmatched get "no-object" down-weighted by `eos_coef=0.1`) +
+  mask BCE + mask dice on matched queries. Applied to all 9 decoder layers
+  (deep supervision). The paper's `[1, 15, 35]` class weights are carried into
+  the per-query classification CE, so the same class-imbalance handling as the
+  baselines is preserved.
+- **Optimizer**: `AdamW(lr=1e-4, weight_decay=0.05)` with `clip_grad_norm=0.01`
+  — Mask2Former needs a 10× smaller LR than the baselines' `Adam(lr=1e-3)`,
+  otherwise the first optimizer step collapses the model into the uniform
+  prediction.
+- **Mixed precision**: bfloat16 autocast in the training loop (no GradScaler —
+  bf16 has the fp32 exponent range). Enabled automatically for Mask2Former.
+- **Validation BatchNorm**: when training from scratch with small batches the
+  encoder's BN running stats take many epochs to stabilise, so
+  `Mask2Former.eval()` keeps BN layers in train mode (batch statistics) to
+  give a reliable validation metric.
+
+### Deviations from the original paper (intentional)
+
+1. **Pixel decoder without MSDeformAttn.** The original uses Multi-Scale
+   Deformable Attention, which requires a CUDA extension that is painful to
+   build on Windows. The pure-PyTorch self-attention + FPN substitute keeps
+   memory bounded and the build dependency-free.
+2. **Trained from scratch** (`encoder_weights=None`), consistent with the
+   other six architectures in this repository. The original Mask2Former
+   always uses an ImageNet-pretrained backbone.
+
+### Training Mask2Former
+
+```bash
+# --amp=auto turns on bfloat16 autocast for Mask2Former automatically:
+python train.py --dataset Combined --model Mask2Former --encoder efficientnet-b7
+
+# Run all four modalities sequentially:
+bash run_m2f_queue.sh
+```
+
+### Results
+
+Mask2Former + EfficientNet-B7, test-set mIoU (trained from scratch, 100 epochs):
+
+| Dataset | IoU Bkg | IoU Coffee | IoU Eucalyptus | mIoU | fwIoU |
+|---------|---------|------------|----------------|------|-------|
+| Combined | 97.11% | 86.64% | 66.68% | 83.47% | 95.29% |
+| Planet | 97.13% | 86.86% | 66.61% | 83.54% | 95.35% |
+| VH | 92.47% | 72.90% | 14.15% | 59.84% | 88.96% |
+| VV | 92.82% | 72.83% | 16.75% | 60.80% | 89.25% |
+
+### Smoke test
+
+```bash
+python smoke_test_mask2former.py
+```
+
+Instantiates `smp.Mask2Former(encoder='efficientnet-b7', in_channels=108,
+classes=3)`, checks the dict output shapes, runs the Hungarian matcher +
+SetCriterion, and verifies that the loss decreases over a few optimisation
+steps on a single batch.
 
 ---
 

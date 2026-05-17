@@ -39,7 +39,7 @@ DATASETS = {
     'VV':       {'channels': 30,  'dir': 'VV_GT6'},
 }
 
-MODELS = ['Unet', 'Linknet', 'UnetPlusPlus', 'PSPNet', 'DeepLabV3Plus', 'Segformer']
+MODELS = ['Unet', 'Linknet', 'UnetPlusPlus', 'PSPNet', 'DeepLabV3Plus', 'Segformer', 'Mask2Former']
 ENCODERS = ['efficientnet-b7', 'resnet101', 'resnext101_32x8d']
 NUM_CLASSES = 3
 
@@ -93,8 +93,12 @@ def evaluate_model(model, data_loader, device):
 
     with torch.no_grad():
         for images, masks in data_loader:
-            images, masks = images.to(device), masks.to(device)
-            preds = model(images).argmax(dim=1)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            out = model(images)
+            if isinstance(out, dict):
+                out = out["semantic"]
+            preds = out.argmax(dim=1)
             conf_matrix += confusion_matrix(
                 masks.view(-1).cpu().numpy(),
                 preds.view(-1).cpu().numpy(),
@@ -132,11 +136,15 @@ def evaluate_single(dataset, model_name, encoder, models_dir, data_dir, device):
         print(f"  Model not found: {model_path}")
         return None
 
+    # Mask2Former was trained with activation=None (see create_model() in
+    # train.py). For mIoU evaluation (argmax-based) the activation choice is
+    # invariant; keeping the two scripts aligned avoids surprises.
+    activation = None if model_name == 'Mask2Former' else 'softmax'
     model = getattr(smp, model_name)(
         encoder_name=encoder,
         encoder_weights=None,
         classes=NUM_CLASSES,
-        activation='softmax',
+        activation=activation,
         in_channels=in_channels,
     )
     model.load_state_dict(torch.load(model_path, map_location=device))

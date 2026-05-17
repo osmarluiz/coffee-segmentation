@@ -34,6 +34,12 @@ from sklearn.metrics import confusion_matrix
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import segmentation_models_pytorch as smp
+from segmentation_models_pytorch.decoders.mask2former.matcher import HungarianMatcher
+from segmentation_models_pytorch.decoders.mask2former.criterion import SetCriterion
+from segmentation_models_pytorch.decoders.mask2former.training import (
+    Mask2FormerTrainEpoch,
+    Mask2FormerValidEpoch,
+)
 from src.data_utils import CustomDataset
 from src.loss_functions import MulticlassDiceLoss, MulticlassFocalLoss
 
@@ -47,7 +53,7 @@ DATASETS = {
     'VV':       {'channels': 30,  'dir': 'VV_GT6'},
 }
 
-MODELS = ['Unet', 'Linknet', 'UnetPlusPlus', 'PSPNet', 'DeepLabV3Plus', 'Segformer']
+MODELS = ['Unet', 'Linknet', 'UnetPlusPlus', 'PSPNet', 'DeepLabV3Plus', 'Segformer', 'Mask2Former']
 
 ENCODERS = ['efficientnet-b7', 'resnet101', 'resnext101_32x8d']
 
@@ -119,20 +125,69 @@ def parse_args():
                    help='Resume training from last checkpoint')
     p.add_argument('--device', type=str, default=None,
                    help='Device (cuda/cpu). Auto-detected if not set.')
+    p.add_argument('--amp', type=str, default='auto',
+                   choices=['auto', 'bfloat16', 'float16', 'none'],
+                   help='Autocast dtype for forward pass. "auto" enables '
+                        'bfloat16 for Mask2Former and disables it for the '
+                        'paper-baseline models. bfloat16 dispenses GradScaler.')
 
     return p.parse_args()
+
+
+# ─── AMP helper ──────────────────────────────────────────────────────────────
+
+def _resolve_amp_dtype(amp_flag, model_name, device):
+    """Resolve the --amp flag into a concrete torch dtype or None."""
+    if device != 'cuda':
+        return None
+    if amp_flag == 'none':
+        return None
+    if amp_flag == 'bfloat16':
+        return torch.bfloat16
+    if amp_flag == 'float16':
+        return torch.float16
+    # 'auto': enable bf16 only for Mask2Former
+    if model_name == 'Mask2Former':
+        return torch.bfloat16
+    return None
 
 
 # ─── Model creation ──────────────────────────────────────────────────────────
 
 def create_model(model_name, encoder_name, in_channels):
-    """Create a segmentation model using SMP."""
+    """Create a segmentation model using SMP.
+
+    Activation note: the other six architectures (the paper baseline) keep
+    `activation='softmax'` in the segmentation head. This means the model
+    output is softmax-normalised before being fed to `nn.CrossEntropyLoss`,
+    which itself applies `log_softmax` internally — i.e. a double softmax.
+    For those models it is a mild inefficiency that the paper tolerates.
+
+    For Mask2Former it is fatal: the decoder's semantic output is already
+    `einsum(softmax(class), sigmoid(mask))` summed over 100 queries, which at
+    initialization yields very similar magnitudes across the 3 classes per
+    pixel. A second softmax then collapses the distribution to ~uniform and
+    the CE gradient effectively vanishes (loss stays pinned at log(3) and the
+    model just predicts background everywhere). We therefore pass logits
+    directly for Mask2Former, while preserving the paper's setup for the
+    baseline models.
+    """
+    activation = None if model_name == 'Mask2Former' else 'softmax'
+    extra_kwargs = {}
+    if model_name == 'Mask2Former':
+        # With Hungarian-matched training, unmatched queries learn the
+        # no-object class and do not destabilise optimisation, so we can
+        # keep the paper default (100). For a 3-class problem with 2-3 GT
+        # instances per image, ~97 queries end up specialising on the
+        # no-object class, which is fine.
+        extra_kwargs['num_queries'] = 100
     return getattr(smp, model_name)(
         encoder_name=encoder_name,
         encoder_weights=None,
         classes=NUM_CLASSES,
-        activation='softmax',
+        activation=activation,
         in_channels=in_channels,
+        **extra_kwargs,
     )
 
 
@@ -204,8 +259,12 @@ def evaluate_model(model, data_loader, device):
 
     with torch.no_grad():
         for images, masks in data_loader:
-            images, masks = images.to(device), masks.to(device)
-            preds = model(images).argmax(dim=1)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            out = model(images)
+            if isinstance(out, dict):
+                out = out["semantic"]
+            preds = out.argmax(dim=1)
 
             pred_flat = preds.view(-1).cpu().numpy()
             mask_flat = masks.view(-1).cpu().numpy()
@@ -230,19 +289,25 @@ def evaluate_model(model, data_loader, device):
 # ─── Training status (resume) ────────────────────────────────────────────────
 
 def save_status(model_dir, epoch, best_loss, best_epoch):
+    # Cast to native Python types — numpy.float32 (from AverageValueMeter.mean)
+    # is not JSON-serializable.
     with open(os.path.join(model_dir, 'training_status.json'), 'w') as f:
         json.dump({
-            'last_completed_epoch': epoch,
-            'best_loss': best_loss,
-            'best_model_epoch': best_epoch,
+            'last_completed_epoch': int(epoch),
+            'best_loss': float(best_loss),
+            'best_model_epoch': int(best_epoch),
         }, f)
 
 
 def load_status(model_dir):
     path = os.path.join(model_dir, 'training_status.json')
     if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            # Truncated / corrupted status (e.g. crash mid-write). Restart clean.
+            print(f"  WARNING: training_status.json is corrupted ({e}); ignoring it.")
     return {'last_completed_epoch': -1, 'best_loss': float('inf'), 'best_model_epoch': -1}
 
 
@@ -263,6 +328,7 @@ def train_single(dataset, model_name, encoder, loss_name, args):
                              f"{model_name}_{encoder}")
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, 'best_model.pth')
+    last_path = os.path.join(model_dir, 'last_model.pth')
 
     # Data
     train_loader, val_loader, test_loader = load_data(
@@ -273,11 +339,47 @@ def train_single(dataset, model_name, encoder, loss_name, args):
     model.to(device)
 
     # Loss and metrics
-    loss_fn = get_loss_fn(loss_name, device)
+    if model_name == 'Mask2Former':
+        # Mask2Former uses Hungarian-matched set prediction, not a dense
+        # per-pixel CE/Dice/Focal loss. Without it, queries have no
+        # specialisation signal and the model collapses to predicting the
+        # uniform class distribution (see project history). The CE weights
+        # CLASS_WEIGHTS [1, 15, 35] from the paper are carried over into the
+        # per-query classification head; the no-object class is down-weighted
+        # via eos_coef.
+        matcher = HungarianMatcher(cost_class=2.0, cost_mask=5.0, cost_dice=5.0)
+        loss_fn = SetCriterion(
+            num_classes=NUM_CLASSES,
+            matcher=matcher,
+            weight_dict={'loss_ce': 2.0, 'loss_mask': 5.0, 'loss_dice': 5.0},
+            eos_coef=0.1,
+            aux_loss=True,
+            class_weight=CLASS_WEIGHTS,
+        )
+        loss_fn.to(device)
+        print(f"  Loss: SetCriterion (Hungarian) with weight_dict "
+              f"loss_ce=2.0, loss_mask=5.0, loss_dice=5.0; "
+              f"class_weight={CLASS_WEIGHTS}, eos_coef=0.1; aux at 9 layers")
+    else:
+        loss_fn = get_loss_fn(loss_name, device)
     metrics = [smp.utils.metrics.mIoU()]
 
     # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Mask2Former is far more sensitive to LR than the CNN-based baselines.
+    # With Adam(lr=1e-3) and random init, the first optimizer step overshoots
+    # into the uniform-prediction attractor (val_loss == log(3)) and never
+    # escapes. The original Mask2Former paper trains with AdamW, lr=1e-4 and
+    # weight_decay=0.05; we adopt that recipe here. The other six baseline
+    # architectures keep the paper's Adam(lr=1e-3) for direct comparison with
+    # the published results.
+    if model_name == 'Mask2Former':
+        m2f_lr = args.lr if args.lr != 0.001 else 1e-4  # 1e-4 unless user overrode
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=m2f_lr, weight_decay=0.05)
+        print(f"  Optimizer: AdamW(lr={m2f_lr}, weight_decay=0.05) "
+              f"[Mask2Former-specific recipe]")
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Resume
     status = load_status(model_dir) if args.resume else {
@@ -286,20 +388,51 @@ def train_single(dataset, model_name, encoder, loss_name, args):
     best_loss = status['best_loss']
     best_epoch = status['best_model_epoch']
 
-    if args.resume and os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"  Resumed from epoch {start_epoch}, best loss: {best_loss:.4f}")
+    if args.resume:
+        # Prefer last_model.pth (latest checkpointed weights) over
+        # best_model.pth: best_model only updates when val_loss improves, so
+        # after a crash it can be many epochs behind the actual training
+        # state. last_model is always the most recent epoch's weights.
+        if os.path.exists(last_path):
+            model.load_state_dict(torch.load(last_path, map_location=device))
+            print(f"  Resumed from epoch {start_epoch} (last_model.pth), "
+                  f"best loss: {best_loss:.4f}")
+        elif os.path.exists(model_path):
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print(f"  Resumed from epoch {start_epoch} (best_model.pth — "
+                  f"last_model not found), best loss: {best_loss:.4f}")
 
     if start_epoch >= args.epochs:
         print(f"  Already trained for {args.epochs} epochs. Skipping.")
     else:
-        # SMP training utilities
-        train_epoch = smp.utils.train.TrainEpoch(
-            model, loss=loss_fn, metrics=metrics,
-            optimizer=optimizer, device=device, verbose=True)
-        valid_epoch = smp.utils.train.ValidEpoch(
-            model, loss=loss_fn, metrics=metrics,
-            device=device, verbose=True)
+        # SMP training utilities with optional AMP autocast (bfloat16 by default
+        # for Mask2Former, disabled for the paper-baseline models).
+        amp_dtype = _resolve_amp_dtype(args.amp, model_name, device)
+        if amp_dtype is not None:
+            print(f"  AMP enabled: autocast(dtype={amp_dtype}) — no GradScaler.")
+
+        if model_name == 'Mask2Former':
+            # Mask2Former wraps a richer interface: the model returns a dict
+            # ({pred_logits, pred_masks, aux_outputs, semantic}), and the loss
+            # is a Hungarian-matched SetCriterion that runs over all decoder
+            # layers (deep supervision).
+            train_epoch = Mask2FormerTrainEpoch(
+                model, criterion=loss_fn, metrics=metrics,
+                optimizer=optimizer, device=device, verbose=True,
+                amp_dtype=amp_dtype)
+            valid_epoch = Mask2FormerValidEpoch(
+                model, criterion=loss_fn, metrics=metrics,
+                device=device, verbose=True,
+                amp_dtype=amp_dtype)
+        else:
+            train_epoch = smp.utils.train.TrainEpoch(
+                model, loss=loss_fn, metrics=metrics,
+                optimizer=optimizer, device=device, verbose=True,
+                amp_dtype=amp_dtype)
+            valid_epoch = smp.utils.train.ValidEpoch(
+                model, loss=loss_fn, metrics=metrics,
+                device=device, verbose=True,
+                amp_dtype=amp_dtype)
 
         t0 = time.time()
         for epoch in range(start_epoch, args.epochs):
@@ -316,6 +449,12 @@ def train_single(dataset, model_name, encoder, loss_name, args):
                 best_epoch = epoch
                 torch.save(model.state_dict(), model_path)
                 print(f"  -> Best model saved (loss: {best_loss:.4f})")
+
+            # Always save the latest weights too so an OS reboot or crash
+            # mid-training can be resumed without losing the more-trained
+            # state (best_model only updates on val_loss improvement, which
+            # can lag many epochs behind the actual learning).
+            torch.save(model.state_dict(), last_path)
 
             save_status(model_dir, epoch, best_loss, best_epoch)
 

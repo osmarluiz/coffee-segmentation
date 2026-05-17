@@ -72,7 +72,10 @@ def process_batch(batch, model, device):
     """Run inference on a batch of image windows."""
     with torch.no_grad():
         tensor = torch.from_numpy(np.stack(batch)).to(device).float()
-        preds = model(tensor).cpu().numpy()
+        out = model(tensor)
+        if isinstance(out, dict):
+            out = out["semantic"]
+        preds = out.cpu().numpy()
     return preds
 
 

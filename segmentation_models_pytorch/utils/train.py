@@ -1,17 +1,35 @@
+import contextlib
 import sys
 import torch
 from tqdm import tqdm as tqdm
 from .meter import AverageValueMeter
 
 
+def _autocast_ctx(amp_dtype, device):
+    """Return an autocast context for the given dtype/device, or nullcontext.
+
+    bfloat16 does NOT need a GradScaler (same exponent range as fp32), so we
+    deliberately do not return one — callers can backprop directly. fp16 also
+    skips GradScaler here for simplicity; if needed, callers should wrap their
+    own training loop.
+    """
+    if amp_dtype is None:
+        return contextlib.nullcontext()
+    device_type = "cuda" if (isinstance(device, str) and "cuda" in device) or \
+                            (hasattr(device, "type") and device.type == "cuda") else "cpu"
+    return torch.amp.autocast(device_type=device_type, dtype=amp_dtype)
+
+
 class Epoch:
-    def __init__(self, model, loss, metrics, stage_name, device="cpu", verbose=True):
+    def __init__(self, model, loss, metrics, stage_name, device="cpu", verbose=True,
+                 amp_dtype=None):
         self.model = model
         self.loss = loss
         self.metrics = metrics
         self.stage_name = stage_name
         self.verbose = verbose
         self.device = device
+        self.amp_dtype = amp_dtype
 
         self._to_device()
 
@@ -48,7 +66,8 @@ class Epoch:
             disable=not (self.verbose),
         ) as iterator:
             for x, y in iterator:
-                x, y = x.to(self.device), y.to(self.device)
+                x = x.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
                 loss, y_pred = self.batch_update(x, y)
 
                 # update loss logs
@@ -74,7 +93,8 @@ class Epoch:
 
 
 class TrainEpoch(Epoch):
-    def __init__(self, model, loss, metrics, optimizer, device="cpu", verbose=True):
+    def __init__(self, model, loss, metrics, optimizer, device="cpu", verbose=True,
+                 amp_dtype=None):
         super().__init__(
             model=model,
             loss=loss,
@@ -82,6 +102,7 @@ class TrainEpoch(Epoch):
             stage_name="train",
             device=device,
             verbose=verbose,
+            amp_dtype=amp_dtype,
         )
         self.optimizer = optimizer
 
@@ -90,7 +111,12 @@ class TrainEpoch(Epoch):
 
     def batch_update(self, x, y):
         self.optimizer.zero_grad()
-        prediction = self.model.forward(x)
+        with _autocast_ctx(self.amp_dtype, self.device):
+            prediction = self.model.forward(x)
+        # bfloat16 has the same exponent range as fp32, so no GradScaler is
+        # needed; we just cast the prediction back to fp32 before the loss for
+        # numerical stability (softmax / log_softmax / CE prefer fp32).
+        prediction = prediction.float()
         loss = self.loss(prediction, y)
         loss.backward()
         self.optimizer.step()
@@ -98,7 +124,8 @@ class TrainEpoch(Epoch):
 
 
 class ValidEpoch(Epoch):
-    def __init__(self, model, loss, metrics, device="cpu", verbose=True):
+    def __init__(self, model, loss, metrics, device="cpu", verbose=True,
+                 amp_dtype=None):
         super().__init__(
             model=model,
             loss=loss,
@@ -106,6 +133,7 @@ class ValidEpoch(Epoch):
             stage_name="valid",
             device=device,
             verbose=verbose,
+            amp_dtype=amp_dtype,
         )
 
     def on_epoch_start(self):
@@ -113,6 +141,8 @@ class ValidEpoch(Epoch):
 
     def batch_update(self, x, y):
         with torch.no_grad():
-            prediction = self.model.forward(x)
+            with _autocast_ctx(self.amp_dtype, self.device):
+                prediction = self.model.forward(x)
+            prediction = prediction.float()
             loss = self.loss(prediction, y)
         return loss, prediction
